@@ -11,10 +11,12 @@
 namespace at { namespace native {
 namespace {
 
+#pragma GCC diagnostic ignored "-Wint-in-bool-context"
+
 using namespace vec256;
 
 void add_kernel(TensorIterator& iter, Scalar alpha_scalar) {
-  AT_DISPATCH_ALL_TYPES(iter.dtype(), "add_cpu", [&]() {
+  AT_DISPATCH_ALL_TYPES_AND(ScalarType::Bool, iter.dtype(), "add_cpu", [&]() {
     auto alpha = alpha_scalar.to<scalar_t>();
     auto alpha_vec = Vec256<scalar_t>(alpha);
     binary_kernel_vec(iter,
@@ -30,7 +32,7 @@ void sub_kernel(TensorIterator& iter, Scalar alpha_scalar) {
 }
 
 void mul_kernel(TensorIterator& iter) {
-  AT_DISPATCH_ALL_TYPES(iter.dtype(), "mul_cpu", [&]() {
+  AT_DISPATCH_ALL_TYPES_AND(ScalarType::Bool, iter.dtype(), "mul_cpu", [&]() {
     binary_kernel_vec(iter,
       [=](scalar_t a, scalar_t b) -> scalar_t { return a * b; },
       [=](Vec256<scalar_t> a, Vec256<scalar_t> b) {
