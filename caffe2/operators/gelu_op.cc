@@ -8,7 +8,9 @@
 #include <vector>
 
 #ifdef _MSC_VER
+#ifndef _USE_MATH_DEFINES
 #define _USE_MATH_DEFINES
+#endif
 #include <math.h>
 #endif // _MSC_VER
 
@@ -126,7 +128,7 @@ REGISTER_GRADIENT(Gelu, GetGeluGradient);
 
 } // namespace caffe2
 
-C10_REGISTER_CAFFE2_OPERATOR_CPU(
+C10_EXPORT_CAFFE2_OP_TO_C10_CPU(
     Gelu,
     "_caffe2::Gelu(Tensor input, bool fast_gelu = False) -> (Tensor output)",
     caffe2::GeluOp<caffe2::CPUContext>);

@@ -2,10 +2,18 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 import copy
 import unittest
 
+try:
+    import torchvision
+    HAS_TORCHVISION = True
+except ImportError:
+    HAS_TORCHVISION = False
+
+skipIfNoTorchVision = unittest.skipIf(not HAS_TORCHVISION, "no torchvision")
+
 import torch
 import torch.jit
 from torch.utils import mkldnn as mkldnn_utils
-from common_utils import TestCase, run_tests, TemporaryFileName
+from torch.testing._internal.common_utils import TestCase, run_tests, TemporaryFileName
 
 from torch.autograd.gradcheck import gradgradcheck, gradcheck
 
@@ -45,7 +53,7 @@ class TestMkldnn(TestCase):
             with self.assertRaises(RuntimeError) as context:
                 torch.randn(1, 2, 3, 4, dtype=torch.float, device=torch.device('cuda')).to_mkldnn()
         # some factory functions
-        for creator in [torch.empty, torch.ones, torch.zeros, torch.randn, torch.rand]:
+        for creator in [torch.ones, torch.randn, torch.rand]:
             with self.assertRaises(RuntimeError) as context:
                 creator(1, 2, 3, 4, dtype=torch.float, device=torch.device('cpu'), layout=torch._mkldnn)
 
@@ -114,6 +122,34 @@ class TestMkldnn(TestCase):
                 self._test_serialization(mkldnn_conv2d, (x.to_mkldnn(),))
                 self._test_tracing(mkldnn_conv2d, (x.to_mkldnn(),))
 
+    def test_conv2d_legacy_jit_model(self):
+        """
+        MKLDNN integration used to serialize models with 5d weight for grouped
+        convolutions, we'd like to preserve this behavior
+        """
+        g = 4
+        conv2d = torch.nn.Conv2d(16, 16, 3, groups=g)
+        conv2d_mkldnn = torch.utils.mkldnn.to_mkldnn(conv2d)
+
+        # contrive legacy conv2d module with a 5-d weight
+        o, i, h, w = conv2d.weight.shape
+        weight_5d = conv2d.weight.reshape((g, o // g, i, h, w))
+        conv2d_mkldnn.weight = weight_5d.to_mkldnn()
+
+        x = torch.randn(1, 16, 8, 8)
+
+        with TemporaryFileName() as fname:
+            torch.jit.save(conv2d_mkldnn, fname)
+            conv2d_loaded = torch.jit.load(fname)
+
+            self.assertEqual(conv2d_mkldnn.weight.ndimension(), 5)
+            # with DNNL upgrade we should switch to no-reordering,
+            # but for now we keep the 5d tensor
+            # self.assertEqual(conv2d_loaded.weight.ndimension(), 4)
+            self.assertEqual(
+                conv2d(x),
+                conv2d_loaded(x.to_mkldnn()).to_dense())
+
     def test_relu(self):
         x = torch.randn((4, 5), dtype=torch.float32) * 10
         self.assertEqual(torch.relu(x), torch.relu(x.to_mkldnn()).to_dense())
@@ -126,16 +162,21 @@ class TestMkldnn(TestCase):
     def test_max_pool2d(self):
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 10, (1,)).item()
-        x = torch.randn(N, C, 64, 64, dtype=torch.float32) * 10
 
-        max_pool2d = torch.nn.MaxPool2d(
-            kernel_size=3,
-            stride=2,
-            padding=1)
+        for stride in [1, 2, 3]:
+            for H, W in [(64, 64), (35, 39), (16, 19), [7, 8]]:
+                x = torch.randn(N, C, H, W, dtype=torch.float32) * 10
 
-        self.assertEqual(
-            max_pool2d(x),
-            max_pool2d(x.to_mkldnn()).to_dense())
+                for ceil_mode in [False, True]:
+                    max_pool2d = torch.nn.MaxPool2d(
+                        kernel_size=3 if not ceil_mode else 7,
+                        stride=stride,
+                        padding=1,
+                        ceil_mode=ceil_mode)
+
+                    self.assertEqual(
+                        max_pool2d(x),
+                        max_pool2d(x.to_mkldnn()).to_dense())
 
     def test_avg_pool2d(self):
         N = torch.randint(3, 10, (1,)).item()
@@ -211,6 +252,55 @@ class TestMkldnn(TestCase):
         torch.add(mx, my, alpha=alpha, out=mkldnn_out)
         self.assertEqual(out, mkldnn_out.to_dense())
 
+    def test_mul(self):
+        N = torch.randint(3, 10, (1,)).item()
+        C = torch.randint(3, 100, (1,)).item()
+        value = torch.randn(1, dtype=torch.float32).item()
+
+        x = torch.randn(N, C, 35, 45, dtype=torch.float32) * 10
+        y = torch.randn(N, C, 35, 45, dtype=torch.float32) * 10
+        mx = x.to_mkldnn()
+        my = y.to_mkldnn()
+
+        # mul
+        self.assertEqual(
+            x * y,
+            (mx * my).to_dense())
+
+        self.assertEqual(
+            x * value,
+            (mx * value).to_dense())
+
+        self.assertEqual(
+            torch.mul(x, y),
+            torch.mul(mx, my).to_dense())
+
+        self.assertEqual(
+            torch.mul(x, value),
+            torch.mul(mx, value).to_dense())
+
+        # mul_
+        x *= y
+        mx *= my
+        self.assertEqual(x, mx.to_dense())
+
+        x *= value
+        mx *= value
+        self.assertEqual(x, mx.to_dense())
+
+        # mul_out
+        out = x.clone()
+        mkldnn_out = out.to_mkldnn()
+        torch.mul(x, y, out=out)
+        torch.mul(mx, my, out=mkldnn_out)
+        self.assertEqual(out, mkldnn_out.to_dense())
+
+        out = x.clone()
+        mkldnn_out = out.to_mkldnn()
+        torch.mul(x, value, out=out)
+        torch.mul(mx, value, out=mkldnn_out)
+        self.assertEqual(out, mkldnn_out.to_dense())
+
     def test_view(self):
         x = torch.randn(3, 4, 5, dtype=torch.float32).to_mkldnn()
         self.assertRaisesRegex(RuntimeError,
@@ -224,6 +314,13 @@ class TestMkldnn(TestCase):
         self.assertEqual(
             x.reshape(size),
             x.to_mkldnn().reshape(size).to_dense(),
+        )
+        # test whether share same memory for plain format tensor
+        y = x.to_mkldnn()
+        z = y.reshape(size).add_(y.reshape(size))
+        self.assertEqual(
+            y.reshape(size).to_dense(),
+            z.to_dense(),
         )
 
     def test_clone(self):
@@ -240,6 +337,15 @@ class TestMkldnn(TestCase):
             z.to_dense(),
         )
 
+    def test_transpose(self):
+        x = torch.randn(3, 4, 5, dtype=torch.float32) * 10
+        for dim1 in range(x.ndim):
+            for dim2 in range(x.ndim):
+                self.assertEqual(
+                    x.transpose(dim1, dim2),
+                    x.to_mkldnn().transpose(dim1, dim2).to_dense(),
+                )
+
     def test_linear(self):
         in_features = torch.randint(3, 10, (1,)).item()
         out_features = torch.randint(3, 100, (1,)).item()
@@ -254,6 +360,14 @@ class TestMkldnn(TestCase):
 
             self._test_serialization(mkldnn_linear, (x.to_mkldnn(),))
             self._test_tracing(mkldnn_linear, (x.to_mkldnn(),))
+
+    def test_softmax(self):
+        x = torch.randn(3, 4, 5, dtype=torch.float32) * 10
+        for dim in range(x.ndim):
+            softmax = torch.nn.Softmax(dim=dim)
+            self.assertEqual(
+                softmax(x),
+                softmax(x.to_mkldnn()).to_dense())
 
     def test_sigmoid(self):
         x = torch.randn(4, 5, dtype=torch.float32) * 10
@@ -286,8 +400,70 @@ class TestMkldnn(TestCase):
         # of type `OpaqueTensorImpl<IDeepTensorWrapperPtr>`.
         x = torch.randn((1, 2), dtype=torch.float, device=torch.device('cpu'))
         x_mkldnn = x.to_mkldnn()
-        with self.assertRaisesRegex(RuntimeError, 'different types of TensorImpl'):
+        with self.assertRaisesRegex(RuntimeError, 'incompatible tensor type'):
             x.data = x_mkldnn
+
+    def test_empty(self):
+        x1 = torch.empty(4, 5, 2, 3, dtype=torch.float32)
+        x2 = torch.empty(4, 5, 2, 3, dtype=torch.float32, layout=torch._mkldnn)
+        self.assertEqual(x1.size(), x2.to_dense().size())
+        self.assertEqual(x1.dtype, x2.to_dense().dtype)
+
+    def test_zero_(self):
+        x1 = torch.randn(4, 5, dtype=torch.float32) * 10
+        x2 = x1.clone().to_mkldnn()
+        self.assertEqual(
+            x1.zero_(),
+            x2.zero_().to_dense(),
+        )
+
+    def test_is_mkldnn(self):
+        x = torch.randn(1, dtype=torch.float32)
+        self.assertFalse(x.is_mkldnn)
+        self.assertTrue(x.to_mkldnn().is_mkldnn)
+
+    # legacy constructor/new doesn't support mkldnn tensors
+    def test_legacy_new_failure(self):
+        x = torch.randn(1, dtype=torch.float32)
+        x_mkldnn = x.to_mkldnn()
+        self.assertRaises(RuntimeError, lambda: x_mkldnn.new(device='cpu'))
+        self.assertRaises(RuntimeError, lambda: x_mkldnn.new(x.storage()))
+        self.assertRaises(RuntimeError, lambda: x_mkldnn.new(x))
+        self.assertRaises(RuntimeError, lambda: x_mkldnn.new(torch.Size([2, 3])))
+        self.assertRaises(RuntimeError, lambda: x_mkldnn.new([6]))
+
+    def test_is_mkldnn_jit(self):
+        class EnsureMkldnn(torch.jit.ScriptModule):
+            @torch.jit.script_method
+            def forward(self, x):
+                if not x.is_mkldnn:
+                    x = x.to_mkldnn()
+                return x
+
+        m = EnsureMkldnn()
+        x = torch.randn(1, dtype=torch.float32)
+        self.assertTrue(m(x).is_mkldnn)
+        self.assertTrue(m(x.to_mkldnn()).is_mkldnn)
+
+    def _test_imagenet_model(self, model):
+        model = model.train(False).float()
+        mkldnn_model = mkldnn_utils.to_mkldnn(copy.deepcopy(model))
+        x = torch.randn(1, 3, 224, 224, dtype=torch.float32)
+        with torch.no_grad():
+            self.assertEqual(
+                model(x),
+                mkldnn_model(x.to_mkldnn()).to_dense(),
+            )
+
+    @skipIfNoTorchVision
+    def test_resnet18(self):
+        model = torchvision.models.resnet.resnet18(pretrained=False)
+        self._test_imagenet_model(model)
+
+    @skipIfNoTorchVision
+    def test_resnext50_32x4d(self):
+        model = torchvision.models.resnet.resnext50_32x4d(pretrained=False)
+        self._test_imagenet_model(model)
 
 
 if __name__ == '__main__':

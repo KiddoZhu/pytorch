@@ -439,7 +439,7 @@ def Train(args):
         stepsz = int(30 * args.epoch_size / total_batch_size / num_shards)
 
         if args.float16_compute:
-            # TODO: merge with multi-prceision optimizer
+            # TODO: merge with multi-precision optimizer
             opt = optimizer.build_fp16_sgd(
                 model,
                 args.base_learning_rate,
@@ -515,6 +515,7 @@ def Train(args):
         devices=gpus,
         rendezvous=rendezvous,
         optimize_gradient_memory=False,
+        use_nccl=args.use_nccl,
         cpu_device=args.use_cpu,
         ideep=args.use_ideep,
         shared_model=args.use_cpu,
@@ -573,6 +574,7 @@ def Train(args):
             post_sync_builder_fun=add_post_sync_ops,
             param_update_builder_fun=None,
             devices=gpus,
+            use_nccl=args.use_nccl,
             cpu_device=args.use_cpu,
         )
         workspace.RunNetOnce(test_model.param_init_net)
@@ -691,8 +693,10 @@ def main():
                         help="Save the trained model to a given name")
     parser.add_argument("--load_model_path", type=str, default=None,
                         help="Load previously saved model to continue training")
-    parser.add_argument("--use_cpu", type=bool, default=False,
+    parser.add_argument("--use_cpu", action="store_true",
                         help="Use CPU instead of GPU")
+    parser.add_argument("--use_nccl", action="store_true",
+                        help="Use nccl for inter-GPU collectives")
     parser.add_argument("--use_ideep", type=bool, default=False,
                         help="Use ideep")
     parser.add_argument('--dtype', default='float',

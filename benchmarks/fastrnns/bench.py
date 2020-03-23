@@ -11,7 +11,7 @@ from .runner import get_nn_runners
 
 
 BenchResult = namedtuple('BenchResult', [
-    'name', 'avg_fwd', 'std_fwd', 'avg_bwd', 'std_bwd',
+    'name', 'avg_fwd', 'std_fwd', 'info_fwd', 'avg_bwd', 'std_bwd', 'info_bwd',
 ])
 
 
@@ -85,9 +85,12 @@ def trainbench(name, rnn_creator, nloops=100, warmup=10,
         return fwd_time, bwd_time
 
     assert device == 'cuda'
-    creator_args = dict(seqLength=seqLength, numLayers=numLayers,
-                        inputSize=inputSize, hiddenSize=hiddenSize,
-                        miniBatch=miniBatch, device=device, seed=seed)
+    creator_args = creator_args = {
+        'seqLength': seqLength, 'numLayers': numLayers,
+        'inputSize': inputSize, 'hiddenSize': hiddenSize,
+        'miniBatch': miniBatch, 'device': device, 'seed': seed
+    }
+
     modeldef = rnn_creator(**creator_args)
 
     [train_batch(modeldef) for _ in range(warmup)]
@@ -97,12 +100,13 @@ def trainbench(name, rnn_creator, nloops=100, warmup=10,
 
     fwd_times = torch.tensor(fwd_times)
     bwd_times = torch.tensor(bwd_times)
-
     return BenchResult(name=name,
                        avg_fwd=fwd_times.mean().item(),
                        std_fwd=fwd_times.std().item(),
+                       info_fwd=fwd_times,
                        avg_bwd=bwd_times.mean().item(),
-                       std_bwd=bwd_times.std().item())
+                       std_bwd=bwd_times.std().item(),
+                       info_bwd=bwd_times)
 
 
 def print_stderr(*args, **kwargs):
@@ -121,23 +125,22 @@ def print_json_oss_format(results):
     print(json.dumps(oss_results))
 
 
-def print_json_pep_format(num_iters, results):
+def print_json_pep_format(results):
     # print the AI-PEP format json string for each model
     for group_name, group_val in results.items():
         for model_name, run_time in group_val.items():
             # Output for AI-PEP
-            print("Caffe2Observer " + json.dumps(
-                {
-                    "type": "NET",
-                    "metric": group_name + "-" + model_name,
-                    "unit": "ms",
-                    "num_runs": num_iters,
-                    "summary": {
-                        "mean": run_time['avg'],
-                        "stdev": run_time['std']
+            num_iters = len(run_time['info'])
+            info = run_time['info'].tolist()
+            for i in range(num_iters):
+                print("Caffe2Observer " + json.dumps(
+                    {
+                        "type": "NET",
+                        "metric": group_name + "-" + model_name,
+                        "unit": "ms",
+                        "value": str(info[i])
                     }
-                }
-            ))
+                ))
 
 
 def bench(rnn_runners, group_name, print_json=False, sep=' ', **params):
@@ -147,15 +150,18 @@ def bench(rnn_runners, group_name, print_json=False, sep=' ', **params):
         with context():
             try:
                 result = trainbench(name, creator, **params)
-                print_stderr(pretty_print(result, sep=sep))
+                # Replace the value of info_fwd and info_bwd to None
+                result_with_no_info = result._replace(
+                    info_fwd='None', info_bwd='None')
+                print_stderr(pretty_print(result_with_no_info, sep=sep))
                 results[name] = result
             except Exception as e:
                 if not print_json:
                     raise
 
     return {
-        group_name: {k: {"avg": v.avg_fwd, "std": v.std_fwd} for k, v in results.items()},
-        group_name + '-backward': {k: {"avg": v.avg_bwd, "std": v.std_bwd} for k, v in results.items()},
+        group_name: {k: {"avg": v.avg_fwd, "std": v.std_fwd, "info": v.info_fwd} for k, v in results.items()},
+        group_name + '-backward': {k: {"avg": v.avg_bwd, "std": v.std_bwd, "info": v.info_bwd} for k, v in results.items()},
     }
 
 
@@ -193,8 +199,24 @@ if __name__ == '__main__':
     parser.add_argument('--cnns', nargs='*',
                         help='What to run. resnet18, resnet18_jit, resnet50, etc')
     parser.add_argument('--group', nargs='*', default=default_groups, help='Which group to run. cnns, rnns, etc.')
+    parser.add_argument('--fuser', default='te', type=str,
+                        help='The fuser backend to use. One of: te, old, or none')
+    parser.add_argument('--cuda_pointwise_loop_level', default=None, type=int)
+    parser.add_argument('--cuda_pointwise_block_count', default=None, type=int)
+    parser.add_argument('--cuda_pointwise_block_size', default=None, type=int)
 
     args = parser.parse_args()
+    assert args.fuser in ['te', 'old', 'none']
+    torch._C._jit_set_texpr_fuser_enabled(args.fuser == 'te')
+    torch._C._jit_override_can_fuse_on_gpu(args.fuser == 'old')
+    torch._C._jit_set_bailout_depth(20)
+    if args.cuda_pointwise_loop_level:
+        torch._C._jit_set_te_cuda_pointwise_loop_levels(args.cuda_pointwise_loop_level)
+    if args.cuda_pointwise_block_count:
+        torch._C._jit_set_te_cuda_pointwise_block_count(args.cuda_pointwise_block_count)
+    if args.cuda_pointwise_block_size:
+        torch._C._jit_set_te_cuda_pointwise_block_size(args.cuda_pointwise_block_size)
+
     rnns = args.rnns or ['cudnn', 'aten', 'jit', 'jit_premul', 'jit_premul_bias', 'jit_simple',
                          'jit_multilayer', 'py']
     cnns = args.cnns or ['resnet18', 'resnet18_jit', 'resnet50', 'resnet50_jit']
@@ -213,8 +235,12 @@ if __name__ == '__main__':
     del bench_args['rnns']
     del bench_args['cnns']
     del bench_args['variable_lstms']
+    del bench_args['fuser']
+    del bench_args['cuda_pointwise_loop_level']
+    del bench_args['cuda_pointwise_block_count']
+    del bench_args['cuda_pointwise_block_size']
 
-    results = dict()
+    results = {}
     if should_bench_varlen_lstms:
         if args.nloops + args.warmup > 30:
             print_stderr(
@@ -230,4 +256,4 @@ if __name__ == '__main__':
     if args.print_json == 'oss':
         print_json_oss_format(results)
     elif args.print_json == 'pep':
-        print_json_pep_format(args.nloops, results)
+        print_json_pep_format(results)
